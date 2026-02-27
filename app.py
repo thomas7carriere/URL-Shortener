@@ -4,7 +4,9 @@ import string
 import hashlib
 from flask_cors import CORS
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
+import redis 
+
 
 from flask import Flask, jsonify, redirect, render_template, request
 from flask_sqlalchemy import SQLAlchemy
@@ -16,16 +18,32 @@ app = Flask(__name__)
 #Allow CORS, only local at the moment (Front end Running on localhost:8080) Need to change for production
 CORS(app) #currently overidden to allow all requests
 
-db_url = os.getenv("DATABASE_URL", "sqlite:///shortener.db")
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+db_connection_string = os.getenv("DB_CONNECTION", "NOT FOUND")
+print(repr(os.getenv("db_connection_string")))
+params = quote_plus(db_connection_string)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_DATABASE_URI"] = 'mssql+pyodbc://?odbc_connect={}'.format(params)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 db = SQLAlchemy(app)
+
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = os.getenv("REDIS_PORT")
+PASSWORD = os.getenv("REDIS_PASSWORD")
+THRESHOLD=5
+
+redis_client = redis.Redis(
+    host = REDIS_HOST,
+    port = REDIS_PORT,
+    ssl=True,
+    ssl_cert_reqs=None,  # try temporarily for debugging
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=5,
+    password = PASSWORD
+)
 
 class Link(db.Model):
     __tablename__ = "links"
@@ -91,8 +109,10 @@ def api_shorten():
         db.session.add(link)
         db.session.commit()
         return jsonify(code=link.code, short_url=build_short_url(link.code)), 201
-
-    existing = Link.query.filter_by(url_hash=url_hash).first()
+    
+    existing.code = redis_client.get(url_hash)
+    if(not existing.code):
+        existing = Link.query.filter_by(url_hash=url_hash).first()
     if existing:
         return jsonify(code=existing.code, short_url=build_short_url(existing.code)), 200
 
@@ -110,11 +130,20 @@ def api_shorten():
 
 @app.get("/r/<code>")
 def follow(code: str):
+    url = redis_client.get(hash)
+    if(url is not None):
+        url_update = Link.query.filter_by(code=code).first()
+        url_update.clicks += 1       
+        db.session.commit()
+        return redirect(url, code=303)
     link = Link.query.filter_by(code=code).first()
     if not link:
         return jsonify(error="Not found"), 404
     link.clicks += 1
     db.session.commit()
+    if(link.clicks >= THRESHOLD):
+        redis_client.set(link.url_hash,link.code) 
+        redis_client.set(link.code,link.url) 
     return redirect(link.url, code=302)
 
 @app.get("/api/<code>")
@@ -128,6 +157,27 @@ def info(code: str):
         clicks=link.clicks,
         created_at=link.created_at.isoformat()
     )
+## helthcheck endpoint
+@app.get("/health")
+def health():
+    return jsonify(status="ok"), 200
+
+def fill_redis():
+    results = Link.query.filter(Link.clicks > THRESHOLD).all()
+    print(results)
+    for result in results:
+        print(f"Result : {result}\n")
+        print(f"hash value : {result.url_hash}\n")
+        print(f"code value : {result.code}\n")
+        print(f"url value : {result.url}\n")
+        redis_client.set(result.url_hash,result.code)    
+        redis_client.set(result.code,result.url)
+        #redis_client.jset()
+    print("Done")
+
+with app.app_context():
+    print("Filling redis")
+    fill_redis()  
 
 if __name__ == "__main__":
     with app.app_context():
